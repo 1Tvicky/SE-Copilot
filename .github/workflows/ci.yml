@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: se_copilot
+          POSTGRES_PASSWORD: se_copilot
+          POSTGRES_DB: se_copilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U se_copilot"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://se_copilot:se_copilot@localhost:5432/se_copilot
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ci-only-secret-not-for-production-use
+      ENCRYPTION_KEY: ci-only-encryption-key-not-for-production
+      EMAIL_PROVIDER: dev-outbox
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build --workspace=packages/shared
+      - run: npm run build --workspace=packages/db
+      - run: npx prisma migrate deploy --schema packages/db/prisma/schema.prisma
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test --workspaces --if-present
+      - name: Pipeline integration tests (Postgres)
+        run: npm run test --workspace=apps/worker
+        env:
+          RUN_DB_TESTS: "1"
+      - run: npm run build --workspace=apps/worker
+      - run: npm run build --workspace=apps/web

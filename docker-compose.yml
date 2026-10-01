@@ -1,0 +1,105 @@
+# Local development: `docker compose up postgres minio` for infra (the job
+# queue runs on Postgres via pg-boss; there is no Redis), then
+# run `npm run dev:web` / `npm run dev:worker` on your host against them
+# (that's how this project was developed and verified — see README).
+#
+# The `web` and `worker` services below let you run the FULL stack in
+# Docker too, but note: media upload uses browser-facing presigned S3 URLs,
+# and MinIO's Docker-internal hostname ("minio") is not reachable from your
+# browser. Swap STORAGE_ENDPOINT below to your real S3-compatible provider
+# (S3, R2, etc.) for any deployment where users need to upload media —
+# that's a single public hostname reachable by both the container and the
+# browser, so the split we have to work around for local MinIO doesn't apply.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: meeting_assistant
+      POSTGRES_PASSWORD: meeting_assistant
+      POSTGRES_DB: meeting_assistant
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meeting_assistant"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local dev stand-in for S3-compatible storage. Reachable at
+  # http://localhost:9000 from both a host-run `npm run dev:web` and your
+  # browser — use that same STORAGE_ENDPOINT in your root .env for local dev.
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: meeting_assistant
+      MINIO_ROOT_PASSWORD: meeting_assistant_secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the storage bucket on first startup (MinIO doesn't
+  # auto-create buckets). Exits immediately once done; ignore its "exited"
+  # status in `docker compose ps` — that's expected, not a failure.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 meeting_assistant meeting_assistant_secret &&
+      mc mb --ignore-existing local/meeting-assistant
+      "
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://meeting_assistant:meeting_assistant@postgres:5432/meeting_assistant
+      # See the file-level comment above: this only works for media upload
+      # if it resolves from the browser too. Point it at a real
+      # S3-compatible endpoint for any non-local deployment.
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://meeting_assistant:meeting_assistant@postgres:5432/meeting_assistant
+      # The worker only ever talks to storage server-side (no presigned
+      # URLs handed to a browser), so MinIO's Docker-internal hostname is
+      # fine here even though it isn't for `web` above.
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_ACCESS_KEY_ID: meeting_assistant
+      STORAGE_SECRET_ACCESS_KEY: meeting_assistant_secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  minio_data:
